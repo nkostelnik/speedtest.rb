@@ -1,59 +1,4 @@
-require 'mechanize'
-
-class Mechanize::HTTP::Agent
-  MAX_RESET_RETRIES = 10
-
-  # We need to replace the core Mechanize HTTP method:
-  #
-  #   Mechanize::HTTP::Agent#fetch
-  #
-  # with a wrapper that handles the infamous "too many connection resets"
-  # Mechanize bug that is described here:
-  #
-  #   https://github.com/sparklemotion/mechanize/issues/123
-  #
-  # The wrapper shuts down the persistent HTTP connection when it fails with
-  # this error, and simply tries again. In practice, this only ever needs to
-  # be retried once, but I am going to let it retry a few times
-  # (MAX_RESET_RETRIES), just in case.
-  #
-  def fetch_with_retry(
-    uri,
-    method    = :get,
-    headers   = {},
-    params    = [],
-    referer   = current_page,
-    redirects = 0
-  )
-    action      = "#{method.to_s.upcase} #{uri.to_s}"
-    retry_count = 0
-
-    begin
-      fetch_without_retry(uri, method, headers, params, referer, redirects)
-    rescue Net::HTTP::Persistent::Error => e
-      # Pass on any other type of error.
-      raise unless e.message =~ /too many connection resets/
-
-      # Pass on the error if we've tried too many times.
-      if retry_count >= MAX_RESET_RETRIES
-        # puts "**** WARN: Mechanize retried connection reset #{MAX_RESET_RETRIES} times and never succeeded: #{action}"
-        raise
-      end
-
-      # Otherwise, shutdown the persistent HTTP connection and try again.
-      # puts "**** WARN: Mechanize retrying connection reset error: #{action}"
-      retry_count += 1
-      self.http.shutdown
-      retry
-    end
-  end
-
-  # Alias so #fetch actually uses our new #fetch_with_retry to wrap the
-  # old one aliased as #fetch_without_retry.
-  alias_method :fetch_without_retry, :fetch
-  alias_method :fetch, :fetch_with_retry
-end
-
+require 'faraday'
 require 'nokogiri'
 
 module Speedtest
@@ -76,7 +21,7 @@ module Speedtest
 	end
 
 	class SpeedTest
-		DEBUG=true
+		DEBUG=false
 
 		DOWNLOAD_FILES = [
 			'speedtest/random750x750.jpg',
@@ -94,9 +39,6 @@ module Speedtest
 		end
 
 		def run
-			@a = Mechanize.new
-			@a.open_timeout=1
-			@a.read_timeout=1
 			server = pickServer
 			@server_root = server[:url]
 			latency = server[:latency]
@@ -125,7 +67,7 @@ module Speedtest
 		end
 
 		def downloadthread(url)
-			page = @a.get(url)
+			page = Faraday.get(url)
 			Thread.current["downloaded"] = page.body.length
 			#log "#{url} #{Thread.current["downloaded"]}"
 		end
@@ -154,7 +96,7 @@ module Speedtest
 		end
 
 		def uploadthread(url, myData)
-			page = @a.post(url, { "content0" => myData })
+			page = Faraday.post(url, { "content0" => myData })
 			log "Uploading: #{url} #{Thread.current["uploaded"]}"
 			Thread.current["uploaded"] = page.body.split('=')[1].to_i
 		end
@@ -191,12 +133,12 @@ module Speedtest
 		end
 
 		def pickServer
-			page = @a.get("http://www.speedtest.net/speedtest-config.php")
+			page = Faraday.get("http://www.speedtest.net/speedtest-config.php")
 			ip,lat,lon=page.body.scan(/<client ip="([^"]*)" lat="([^"]*)" lon="([^"]*)"/)[0]
 			orig=GeoPoint.new(lat, lon)
 			log "Your IP: #{ip}\nYour coordinates: #{orig}\n"
 
-			page = @a.get("http://www.speedtest.net/speedtest-servers.php")
+			page = Faraday.get("http://www.speedtest.net/speedtest-servers.php")
 			sorted_servers=page.body.scan(/<server url="([^"]*)" lat="([^"]*)" lon="([^"]*)/).map { |x| {
 				:distance => orig.distance(GeoPoint.new(x[1],x[2])),
 				:url => x[0].split(/(http:\/\/.*)\/speedtest.*/)[1]
@@ -226,7 +168,7 @@ module Speedtest
 				start=Time.new
 				msec=Speedtest::timemillis(start)
 				begin
-					page=@a.get("#{server}/speedtest/latency.txt?x=#{msec}")
+					page=Faraday.get("#{server}/speedtest/latency.txt?x=#{msec}")
 					times << Time.new-start
 				rescue Timeout::Error
 					times << 999999
