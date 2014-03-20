@@ -1,4 +1,59 @@
 require 'mechanize'
+
+class Mechanize::HTTP::Agent
+  MAX_RESET_RETRIES = 10
+
+  # We need to replace the core Mechanize HTTP method:
+  #
+  #   Mechanize::HTTP::Agent#fetch
+  #
+  # with a wrapper that handles the infamous "too many connection resets"
+  # Mechanize bug that is described here:
+  #
+  #   https://github.com/sparklemotion/mechanize/issues/123
+  #
+  # The wrapper shuts down the persistent HTTP connection when it fails with
+  # this error, and simply tries again. In practice, this only ever needs to
+  # be retried once, but I am going to let it retry a few times
+  # (MAX_RESET_RETRIES), just in case.
+  #
+  def fetch_with_retry(
+    uri,
+    method    = :get,
+    headers   = {},
+    params    = [],
+    referer   = current_page,
+    redirects = 0
+  )
+    action      = "#{method.to_s.upcase} #{uri.to_s}"
+    retry_count = 0
+
+    begin
+      fetch_without_retry(uri, method, headers, params, referer, redirects)
+    rescue Net::HTTP::Persistent::Error => e
+      # Pass on any other type of error.
+      raise unless e.message =~ /too many connection resets/
+
+      # Pass on the error if we've tried too many times.
+      if retry_count >= MAX_RESET_RETRIES
+        # puts "**** WARN: Mechanize retried connection reset #{MAX_RESET_RETRIES} times and never succeeded: #{action}"
+        raise
+      end
+
+      # Otherwise, shutdown the persistent HTTP connection and try again.
+      # puts "**** WARN: Mechanize retrying connection reset error: #{action}"
+      retry_count += 1
+      self.http.shutdown
+      retry
+    end
+  end
+
+  # Alias so #fetch actually uses our new #fetch_with_retry to wrap the
+  # old one aliased as #fetch_without_retry.
+  alias_method :fetch_without_retry, :fetch
+  alias_method :fetch, :fetch_with_retry
+end
+
 require 'nokogiri'
 
 module Speedtest
@@ -21,7 +76,7 @@ module Speedtest
 	end
 
 	class SpeedTest
-		DEBUG=false
+		DEBUG=true
 
 		DOWNLOAD_FILES = [
 			'speedtest/random750x750.jpg',
@@ -29,10 +84,10 @@ module Speedtest
 		]
 
 		UPLOAD_SIZES = [
-			197190,
-			483960
+			19719,
+			48396
 		]
-		DOWNLOAD_RUNS=4
+		DOWNLOAD_RUNS=2
 
 		def initialize(argv)
 			#noting yet
@@ -45,11 +100,11 @@ module Speedtest
 			server = pickServer
 			@server_root = server[:url]
 			latency = server[:latency]
-			puts "Server #{@server_root}"
+			log "Server #{@server_root}"
 			downRate = download
-			puts "Download: #{pretty_speed downRate}"
+			log "Download: #{pretty_speed downRate}"
 			upRate = upload
-			puts "Upload: #{pretty_speed upRate}"
+			log "Upload: #{pretty_speed upRate}"
 			{:server => @server_root, :latency => latency, :downRate => downRate, :upRate => upRate}
 		end
 
@@ -79,28 +134,29 @@ module Speedtest
 			threads=[]
 
 			start_time=Time.new
-			DOWNLOAD_FILES.each { |f| 
+			DOWNLOAD_FILES.each { |f|
 				1.upto(DOWNLOAD_RUNS) { |i|
 					threads << Thread.new(f) { |myPage|
 						msec=Speedtest::timemillis(Time.new)
+						log "#{@server_root}/#{myPage}?x=#{msec}&y=#{i}"
 						downloadthread("#{@server_root}/#{myPage}?x=#{msec}&y=#{i}")
 					}
 				}
 			}
 			total_downloaded=0
-			threads.each { |t|  
+			threads.each { |t|
 				t.join
 				total_downloaded += t["downloaded"]
 			}
-			total_time=Time.new - start_time 
+			total_time=Time.new - start_time
 			log "Took #{total_time} seconds to download #{total_downloaded} bytes in #{threads.length} threads"
 			total_downloaded * 8 / total_time
 		end
 
 		def uploadthread(url, myData)
 			page = @a.post(url, { "content0" => myData })
+			log "Uploading: #{url} #{Thread.current["uploaded"]}"
 			Thread.current["uploaded"] = page.body.split('=')[1].to_i
-			#log "#{url} #{Thread.current["uploaded"]}"
 		end
 
 		def randomString(alphabet, size)
@@ -111,25 +167,25 @@ module Speedtest
 			runs=4
 			data=[]
 			UPLOAD_SIZES.each { |size|
-				1.upto(runs) { 
+				1.upto(runs) {
 					data << randomString(('A'..'Z').to_a, size)
 				}
 			}
 
 			threads=[]
 			start_time=Time.new
-			threads = data.map { |data| 
+			threads = data.map { |data|
 				Thread.new(data) { |myData|
 					msec=Speedtest::timemillis(Time.new)
 					uploadthread("#{@server_root}//speedtest/upload.php?x=#{rand}", myData)
 				}
 			}
 			total_uploaded=0
-			threads.each { |t|  
+			threads.each { |t|
 				t.join
 				total_uploaded += t["uploaded"]
 			}
-			total_time=Time.new - start_time 
+			total_time=Time.new - start_time
 			log "Took #{total_time} seconds to upload #{total_uploaded} bytes in #{threads.length} threads"
 			total_uploaded * 8 / total_time
 		end
@@ -146,12 +202,19 @@ module Speedtest
 				:url => x[0].split(/(http:\/\/.*)\/speedtest.*/)[1]
 			} }.sort_by { |x| x[:distance] }
 
-			# sort the nearest 10 by download latency
-			latency_sorted_servers=sorted_servers[0..9].map { |x|
+			log "### All Servers sorted by distance ###"
+			log sorted_servers
+
+			# sort the nearest 3 by download latency
+			latency_sorted_servers=sorted_servers[0..2].map { |x|
 				{
 				:latency => ping(x[:url]),
 				:url => x[:url]
 				}}.sort_by { |x| x[:latency] }
+
+			log "### Top 3 closest Servers sorted by latency ###"
+			log latency_sorted_servers
+
 			selected=latency_sorted_servers[0]
 			log "Automatically selected server: #{selected[:url]} - #{selected[:latency]} ms"
 			selected
